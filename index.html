@@ -245,8 +245,9 @@ const state = {
   src: null,        // full-res canvas of the photo
   srcData: null,    // its ImageData (lazy)
   view: null,       // downscaled canvas for drawing the editor
-  corners: null,    // 4 points [x,y] in source pixels
-  autoCorners: null,// what auto-detect found (null if nothing)
+  corners: null,    // 4 points [x,y] in source pixels: top-left, top-right, bottom-right, bottom-left
+  folds: null,      // { axis: "h"|"v", lines: [[p, q], ...] }: fold lines across the page, or null
+  auto: null,       // what auto-detect found: { corners, folds } (null if nothing)
   ratio: "auto",
   base: null,       // straightened ImageData
   full: {},         // filter name -> full-res filtered ImageData (current filter only)
@@ -301,9 +302,15 @@ async function loadFile(file) {
     v.getContext("2d").drawImage(c, 0, 0, v.width, v.height);
     let found = null;
     try { found = detectDocument(v); } catch (e) { console.warn("Edge detection failed", e); }
-    if (found) found = found.map(([x, y]) => [clamp(x / kv, 0, w), clamp(y / kv, 0, h)]);
-    Object.assign(state, { src: c, srcData: null, view: v, autoCorners: found, corners: found ? found.map((p) => [...p]) : defaultCorners(w, h) });
-    setHint(found ? "Page found. Drag a circle to fine-tune." : "Couldn't find the page. Drag the circles onto its corners.");
+    const toSrc = ([x, y]) => [clamp(x / kv, 0, w), clamp(y / kv, 0, h)];
+    const auto = found && {
+      corners: found.quad.map(toSrc),
+      folds: found.folds && { axis: found.folds.axis, lines: found.folds.lines.map((l) => l.map(toSrc)) },
+    };
+    Object.assign(state, { src: c, srcData: null, view: v, auto });
+    applyAuto();
+    if (!auto) state.corners = defaultCorners(w, h);
+    setHint(autoHint());
     showScreen("adjust");
   } catch (e) {
     toast(e.message || "Could not open the photo.");
@@ -316,6 +323,17 @@ function defaultCorners(w, h) {
   const mx = w * 0.1, my = h * 0.1;
   return [[mx, my], [w - mx, my], [w - mx, h - my], [mx, h - my]];
 }
+function autoHint() {
+  const a = state.auto;
+  if (!a) return "Couldn't find the page. Drag the circles onto its corners.";
+  if (!a.folds) return "Page found. Drag a circle to fine-tune.";
+  return `Page and ${a.folds.lines.length > 1 ? "folds" : "fold"} found. Drag a circle to fine-tune.`;
+}
+function applyAuto() {
+  const a = state.auto;
+  state.corners = a ? a.corners.map((p) => [...p]) : state.corners;
+  state.folds = a && a.folds ? { axis: a.folds.axis, lines: a.folds.lines.map((l) => l.map((p) => [...p])) } : null;
+}
 function setHint(text) { const el = $("#adjHint"); el.textContent = text; el.hidden = !text; }
 for (const id of ["#cameraInput", "#libraryInput"]) {
   $(id).addEventListener("change", (e) => {
@@ -326,11 +344,17 @@ for (const id of ["#cameraInput", "#libraryInput"]) {
 }
 
 /* ---------- Automatic page detection ----------
-   Two independent guesses, the most page-like one wins:
+   Three independent rough guesses at a small size:
    A) edges: find edges (Canny), flood the background in from the photo's border;
       the page is a big region the flood can't reach.
    B) brightness: paper is usually brighter and less colorful than what it lies on.
-   Each region becomes a convex hull, then the biggest 4-corner shape inside it. */
+   C) background color: learn the surface's colors from the photo's border; the page
+      is whatever doesn't match them (keeps colored bands and logos on the page).
+   Each region becomes a convex hull, then the biggest 4-corner shape inside it.
+   Each shape's sides are then snapped onto the real edges in the sharper image,
+   and the outermost shape that is well backed by edges wins.
+   Finally each side is checked for bends: matching bends on opposite sides mean
+   the page was folded, and each flat panel is then straightened on its own. */
 function detectDocument(canvas) {
   const S = 640;
   const k = Math.min(1, S / Math.max(canvas.width, canvas.height));
@@ -344,7 +368,7 @@ function detectDocument(canvas) {
   for (let i = 0, j = 0; i < n; i++, j += 4) { R[i] = px[j]; G[i] = px[j + 1]; B[i] = px[j + 2]; }
   for (const a of [R, G, B]) gaussian5(a, w, h);
 
-  const cands = [];
+  const masks = [];
   // A) Edge-enclosed regions
   const edges = canny(R, G, B, w, h);
   const thick = dilate(edges, w, h, 2);
@@ -353,7 +377,7 @@ function detectDocument(canvas) {
   const outside = floodFromBorder(open, w, h);
   const inside = new Uint8Array(n);
   for (let i = 0; i < n; i++) inside[i] = open[i] && !outside[i] ? 1 : 0;
-  for (const m of biggestComponents(inside, w, h, 3)) cands.push(evaluateRegion(dilate(m, w, h, 3), w, h));
+  for (const m of biggestComponents(inside, w, h, 3)) masks.push(dilate(m, w, h, 3));
 
   // B) Bright, low-color regions (Otsu threshold)
   const score = new Uint8Array(n);
@@ -365,11 +389,310 @@ function detectDocument(canvas) {
   let bright = new Uint8Array(n);
   for (let i = 0; i < n; i++) bright[i] = score[i] > t ? 1 : 0;
   bright = dilate(erode(bright, w, h, 3), w, h, 3); // drop specks and thin lines
-  for (const m of biggestComponents(bright, w, h, 3)) cands.push(evaluateRegion(m, w, h));
+  masks.push(...biggestComponents(bright, w, h, 3));
 
-  let best = null;
-  for (const cd of cands) if (cd && (!best || cd.score > best.score)) best = cd;
-  return best ? orderCorners(best.quad.map(([x, y]) => [x / k, y / k])) : null;
+  // C) Everything that doesn't look like the surface around the page.
+  const bgLike = backgroundLike(R, G, B, w, h);
+  const bg = floodFromBorder(bgLike, w, h);
+  let fg = new Uint8Array(n);
+  for (let i = 0; i < n; i++) fg[i] = bg[i] ? 0 : 1;
+  fg = dilate(erode(fg, w, h, 3), w, h, 3); // cut thin bridges to nearby objects
+  masks.push(...biggestComponents(fg, w, h, 3));
+
+  // Rough 4-corner shapes, in the coordinates of `canvas`.
+  const quads = [], cdiag = Math.hypot(canvas.width, canvas.height);
+  for (const m of masks) {
+    const r = evaluateRegion(m, w, h);
+    if (!r) continue;
+    const q = orderCorners(r.quad.map(([x, y]) => [x / k, y / k]));
+    if (!quads.some((o) => o.every((p, i) => dist(p, q[i]) < 0.01 * cdiag))) quads.push(q);
+  }
+  if (!quads.length) return null;
+
+  // Snap each side onto the real page edge, then keep the outermost outline
+  // that is well backed by edges (the page itself, not a band inside it).
+  const fine = finePixels(canvas);
+  const refined = quads.map((q) => refineQuad(q, fine)).filter(Boolean);
+  if (!refined.length) return null;
+  const top = Math.max(...refined.map((r) => r.support));
+  const good = refined.filter((r) => r.support >= Math.max(0.45, top * 0.8)).sort((a, b) => b.area - a.area);
+  if (!good.length) return null;
+  // Look for folds on the winner only (it's the slow part).
+  const chosen = refineQuad(good[0].rough, fine, true) || good[0];
+  detectDocument.last = { quads, refined, chosen }; // for debugging
+  return { quad: chosen.quad, folds: chosen.folds };
+}
+
+// Pixels whose color matches one of the main colors found along the photo's border.
+function backgroundLike(R, G, B, w, h) {
+  const n = w * h, band = Math.max(2, Math.round(0.04 * Math.min(w, h)));
+  const samples = [];
+  for (let y = 0; y < h; y += 2) for (let x = 0; x < w; x += 2) {
+    if (x < band || y < band || x >= w - band || y >= h - band) { const i = y * w + x; samples.push([R[i], G[i], B[i]]); }
+  }
+  // k-means with deterministic farthest-point seeding
+  const K = 6, d2 = (a, b) => (a[0] - b[0]) ** 2 + (a[1] - b[1]) ** 2 + (a[2] - b[2]) ** 2;
+  const centers = [samples[0].slice()];
+  while (centers.length < K) {
+    let bi = 0, bd = -1;
+    for (let s = 0; s < samples.length; s += 3) {
+      let d = Infinity; for (const c of centers) d = Math.min(d, d2(c, samples[s]));
+      if (d > bd) { bd = d; bi = s; }
+    }
+    centers.push(samples[bi].slice());
+  }
+  const assign = new Int32Array(samples.length);
+  for (let it = 0; it < 10; it++) {
+    const sum = centers.map(() => [0, 0, 0, 0]);
+    samples.forEach((s, j) => {
+      let bc = 0, bd = Infinity;
+      centers.forEach((c, ci) => { const d = d2(c, s); if (d < bd) { bd = d; bc = ci; } });
+      assign[j] = bc; const t = sum[bc]; t[0] += s[0]; t[1] += s[1]; t[2] += s[2]; t[3]++;
+    });
+    sum.forEach((t, ci) => { if (t[3]) centers[ci] = [t[0] / t[3], t[1] / t[3], t[2] / t[3]]; });
+  }
+  // Each meaningful cluster gets a tolerance from its own spread.
+  const spread = centers.map(() => [0, 0]);
+  samples.forEach((s, j) => { const sp = spread[assign[j]]; sp[0] += Math.sqrt(d2(s, centers[assign[j]])); sp[1]++; });
+  const model = centers
+    .map((c, ci) => ({ c, n: spread[ci][1], tol: spread[ci][1] ? clamp(2.5 * spread[ci][0] / spread[ci][1], 16, 40) : 0 }))
+    .filter((m) => m.n > samples.length * 0.04);
+  const out = new Uint8Array(n);
+  for (let i = 0; i < n; i++) {
+    const r = R[i], g = G[i], b = B[i];
+    for (const m of model) {
+      if ((r - m.c[0]) ** 2 + (g - m.c[1]) ** 2 + (b - m.c[2]) ** 2 < m.tol * m.tol) { out[i] = 1; break; }
+    }
+  }
+  return out;
+}
+
+// Blurred color planes of the editor-size image, for precise edge fitting.
+function finePixels(canvas) {
+  const w = canvas.width, h = canvas.height, n = w * h;
+  const d = canvas.getContext("2d", { willReadFrequently: true }).getImageData(0, 0, w, h).data;
+  const R = new Float32Array(n), G = new Float32Array(n), B = new Float32Array(n);
+  for (let i = 0, j = 0; i < n; i++, j += 4) { R[i] = d[j]; G[i] = d[j + 1]; B[i] = d[j + 2]; }
+  for (const a of [R, G, B]) gaussian5(a, w, h);
+  return { R, G, B, w, h };
+}
+
+// Moves each side of a rough quad onto the strongest nearby edge (a straight line
+// fitted through many edge points), then uses where the lines cross as corners.
+function refineQuad(q, img, withFolds) {
+  const { R, G, B, w, h } = img, diag = Math.hypot(w, h);
+  const sample = (a, x, y) => {
+    x = clamp(x, 0, w - 1.001); y = clamp(y, 0, h - 1.001);
+    const x0 = x | 0, y0 = y | 0, fx = x - x0, fy = y - y0, i = y0 * w + x0;
+    const t = a[i] + (a[i + 1] - a[i]) * fx, b = a[i + w] + (a[i + w + 1] - a[i + w]) * fx;
+    return t + (b - t) * fy;
+  };
+  // Color step across an edge at offset o along the normal: average of several samples
+  // on each side, so fine textures (striped fabric, wood grain) cancel out while the
+  // step from paper to background stays strong.
+  const response = (px, py, nx, ny, o) => {
+    let r = 0, g = 0, b = 0;
+    for (const k of [1.5, 3.5, 5.5]) {
+      const xi = px + nx * (o - k), yi = py + ny * (o - k), xo = px + nx * (o + k), yo = py + ny * (o + k);
+      r += sample(R, xo, yo) - sample(R, xi, yi); g += sample(G, xo, yo) - sample(G, xi, yi); b += sample(B, xo, yo) - sample(B, xi, yi);
+    }
+    return Math.hypot(r, g, b) / 3;
+  };
+  const cx = (q[0][0] + q[1][0] + q[2][0] + q[3][0]) / 4, cy = (q[0][1] + q[1][1] + q[2][1] + q[3][1]) / 4;
+  const D = Math.max(6, 0.012 * diag), tol = Math.max(1.5, 0.0015 * diag);
+  let seed = 12345;
+  const random = () => (seed = (seed * 1103515245 + 12345) & 0x7fffffff) / 0x7fffffff;
+  // RANSAC line through points (ignores text, stripes, clutter), then least squares.
+  const ransac = (pts, span, dir, minIn) => {
+    if (pts.length < minIn) return null;
+    let bestIn = null;
+    for (let it = 0; it < 80; it++) {
+      const p1 = pts[(random() * pts.length) | 0], p2 = pts[(random() * pts.length) | 0];
+      const L = dist(p1, p2); if (L < span * 0.25) continue;
+      const ux = (p2[0] - p1[0]) / L, uy = (p2[1] - p1[1]) / L;
+      if (Math.abs(ux * dir[0] + uy * dir[1]) < 0.985) continue; // must run roughly along the side
+      const inl = pts.filter((p) => Math.abs((p[0] - p1[0]) * uy - (p[1] - p1[1]) * ux) < tol);
+      if (!bestIn || inl.length > bestIn.length) bestIn = inl;
+    }
+    if (!bestIn || bestIn.length < minIn) return null;
+    const line = fitLine(bestIn);
+    return Math.abs(line.d[0] * dir[0] + line.d[1] * dir[1]) > 0.985 ? { line, n: bestIn.length } : null;
+  };
+  // Folded or curled pages have bent sides, so each corner is placed using the
+  // stretch of edge next to it: every side gets a line near each of its two ends.
+  const starts = [], ends = [], supports = [], bends = [], edgePts = [];
+  for (let s = 0; s < 4; s++) {
+    const a = q[s], b = q[(s + 1) % 4], len = dist(a, b);
+    const dx = (b[0] - a[0]) / len, dy = (b[1] - a[1]) / len;
+    let nx = -dy, ny = dx;
+    if (nx * ((a[0] + b[0]) / 2 - cx) + ny * ((a[1] + b[1]) / 2 - cy) < 0) { nx = -nx; ny = -ny; } // outward
+    const N = clamp(Math.round(len / 5), 20, 160), pts = [];
+    for (let k = 0; k < N; k++) {
+      const t = 0.06 + 0.88 * k / (N - 1), px = a[0] + (b[0] - a[0]) * t, py = a[1] + (b[1] - a[1]) * t;
+      let best = 0, bo = 0;
+      const resp = [];
+      for (let o = -D; o <= D; o += 1) {
+        const v = response(px, py, nx, ny, o);
+        resp.push(v);
+        if (v > best) { best = v; bo = o; }
+      }
+      if (best < 22) continue;
+      const j = resp.indexOf(best);
+      if (j > 0 && j < resp.length - 1) { // sub-pixel peak
+        const l = resp[j - 1], r = resp[j + 1], den = l - 2 * best + r;
+        if (den < 0) bo += 0.5 * (l - r) / den;
+      }
+      pts.push([px + nx * bo, py + ny * bo, t, bo]); // position, place along the side, offset from it
+    }
+    const dir = [dx, dy], rough = { p: [(a[0] + b[0]) / 2, (a[1] + b[1]) / 2], d: dir };
+    const whole = ransac(pts, len, dir, Math.max(8, N * 0.3));
+    const fallback = whole ? whole.line : rough;
+    const piece = (lo, hi, span) => ransac(pts.filter((p) => p[2] >= lo && p[2] <= hi), len * span, dir, Math.max(5, N * 0.1));
+    const sb = withFolds && pts.length >= 16 ? findBends(pts, a, [dx, dy], [nx, ny], len, tol) : [];
+    if (sb.length) {
+      // Folded side: straight pieces between the bends; corners use the end pieces.
+      const cuts = [0, ...sb.map((p) => p[2]), 1], lines = [];
+      let n = 0;
+      for (let i = 0; i + 1 < cuts.length; i++) {
+        const r = piece(cuts[i], cuts[i + 1], (cuts[i + 1] - cuts[i]) * 0.5);
+        lines.push(r ? r.line : fallback); n += r ? r.n : 0;
+      }
+      starts.push(lines[0]); ends.push(lines[lines.length - 1]);
+      supports.push(Math.max(whole ? whole.n : 0, n) / N);
+    } else {
+      // Straight or gently curled side: a line near each end.
+      const s0 = piece(0, 0.45, 0.4), s1 = piece(0.55, 1, 0.4);
+      starts.push(s0 ? s0.line : fallback); ends.push(s1 ? s1.line : fallback);
+      supports.push(Math.max(whole ? whole.n : 0, (s0 ? s0.n : 0) + (s1 ? s1.n : 0)) / N);
+    }
+    bends.push(sb); edgePts.push(pts);
+  }
+  const quad = [];
+  for (let s = 0; s < 4; s++) {
+    const p = intersect(ends[(s + 3) % 4], starts[s]);
+    if (!p || dist(p, q[s]) > 0.05 * diag) return null;
+    quad.push(p);
+  }
+  if (!isConvex(quad)) return null;
+  return { quad, rough: q, folds: pairFolds(bends), edgePts, bends, sides: supports.map((v) => +v.toFixed(2)), support: supports.reduce((x, y) => x + y, 0) / 4, area: polyArea(quad) };
+}
+
+// Models one side's edge as a continuous line that may bend at 1 or 2 places (a page
+// folded in half or in three) and keeps the simplest model that explains the edge;
+// each bend has to earn its place. Fitting the bent line as one continuous piece
+// pins down where it bends far better than crossing two separately fitted lines.
+// Returns the bend points [x, y, t] in order along the side (t = 0..1).
+function findBends(pts, a, dir, nrm, len, tol) {
+  const n = pts.length, c2 = (2 * tol) ** 2;
+  const U = pts.map((p) => p[2] * len), V = pts.map((p) => p[3]); // along the side, offset from it
+  // Least squares for v = c0 + c1*u + sum_j cj*max(0, u - k_j), ignoring far-off points (clutter).
+  const f = new Float64Array(4), use = new Uint8Array(n);
+  const solve = (knots) => {
+    const K = knots.length, m = 2 + K, w = m + 1;
+    const basis = (u) => { f[0] = 1; f[1] = u; for (let j = 0; j < K; j++) f[2 + j] = u > knots[j] ? u - knots[j] : 0; };
+    const at = (u) => { basis(u); let v = 0; for (let r = 0; r < m; r++) v += f[r] * coef[r]; return v; };
+    let coef = null;
+    use.fill(1);
+    for (let pass = 0; pass < 3; pass++) {
+      const A = new Float64Array(m * w);
+      let cnt = 0;
+      for (let i = 0; i < n; i++) {
+        if (!use[i]) continue;
+        basis(U[i]); cnt++;
+        for (let r = 0; r < m; r++) { const fr = f[r]; for (let c = 0; c < m; c++) A[r * w + c] += fr * f[c]; A[r * w + m] += fr * V[i]; }
+      }
+      if (cnt < m + 2 || !(coef = gauss(A, m))) return null;
+      for (let i = 0; i < n; i++) use[i] = (V[i] - at(U[i])) ** 2 < c2 ? 1 : 0;
+    }
+    let cost = 0;
+    for (let i = 0; i < n; i++) cost += Math.min((V[i] - at(U[i])) ** 2, c2);
+    const c = Array.from(coef);
+    return { coef: c, cost, at: (u) => { let v = c[0] + c[1] * u; for (let j = 0; j < K; j++) if (u > knots[j]) v += c[2 + j] * (u - knots[j]); return v; } };
+  };
+  const u0 = U[0], u1 = U[n - 1], span = u1 - u0, gap = span * 0.12, steps = 40;
+  const grid = []; for (let i = 0; i <= steps; i++) { const k = u0 + span * (0.1 + 0.8 * i / steps); grid.push(k); }
+  const penalty = n * (0.3 * tol) ** 2;
+  let best = { cost: (solve([]) || { cost: Infinity }).cost, knots: [] };
+  for (const k of grid) { const r = solve([k]); if (r && r.cost + penalty < best.cost) best = { cost: r.cost + penalty, knots: [k] }; }
+  for (const k1 of grid) for (const k2 of grid) {
+    if (k2 - k1 < gap) continue;
+    const r = solve([k1, k2]); if (r && r.cost + 2 * penalty < best.cost) best = { cost: r.cost + 2 * penalty, knots: [k1, k2] };
+  }
+  if (!best.knots.length) return [];
+  // Fine-tune each bend position, one pixel at a time.
+  const knots = best.knots.slice();
+  for (let round = 0; round < 2; round++) {
+    for (let j = 0; j < knots.length; j++) {
+      let bk = knots[j], bc = Infinity;
+      for (let k = knots[j] - span / steps; k <= knots[j] + span / steps; k += 1) {
+        const ks = knots.slice(); ks[j] = k;
+        const r = solve(ks); if (r && r.cost < bc) { bc = r.cost; bk = k; }
+      }
+      knots[j] = bk;
+    }
+  }
+  const fit = solve(knots);
+  if (!fit) return [];
+  const out = [];
+  for (let j = 0; j < knots.length; j++) {
+    const ang = Math.atan(Math.abs(fit.coef[2 + j])) * 180 / Math.PI; // change of direction at this bend
+    if (ang < 0.3 || ang > 20) return [];
+    const k = knots[j], v = fit.at(k);
+    out.push([a[0] + dir[0] * k + nrm[0] * v, a[1] + dir[1] * k + nrm[1] * v, k / len]);
+  }
+  return out.filter((p) => p[2] > 0.08 && p[2] < 0.92);
+}
+function gauss(A, m) { // solves an m x (m+1) augmented system stored row by row; null if singular
+  const w = m + 1;
+  for (let c = 0; c < m; c++) {
+    let p = c;
+    for (let r = c + 1; r < m; r++) if (Math.abs(A[r * w + c]) > Math.abs(A[p * w + c])) p = r;
+    if (Math.abs(A[p * w + c]) < 1e-9) return null;
+    if (p !== c) for (let k = 0; k < w; k++) { const t = A[c * w + k]; A[c * w + k] = A[p * w + k]; A[p * w + k] = t; }
+    for (let r = 0; r < m; r++) {
+      if (r === c) continue;
+      const fct = A[r * w + c] / A[c * w + c];
+      for (let k = c; k < w; k++) A[r * w + k] -= fct * A[c * w + k];
+    }
+  }
+  const x = new Float64Array(m);
+  for (let i = 0; i < m; i++) x[i] = A[i * w + m] / A[i * w + i];
+  return x;
+}
+
+// A fold shows as bends at matching heights on the left and right sides (a
+// horizontal fold) or on the top and bottom sides (a vertical fold).
+// Returns { axis: "h" | "v", lines: [[p, q], ...] } in reading order, or null.
+function pairFolds(bends) {
+  const flip = (list) => list.map((p) => [p[0], p[1], 1 - p[2]]).reverse();
+  const pair = (A, B) => {
+    const lines = [];
+    for (const a of A) {
+      let best = null;
+      for (const b of B) if (Math.abs(a[2] - b[2]) < 0.2 && (!best || Math.abs(a[2] - b[2]) < Math.abs(a[2] - best[2]))) best = b;
+      if (best && !lines.some((l) => l[1] === best)) lines.push([a, best]);
+    }
+    return lines.map(([a, b]) => [[a[0], a[1]], [b[0], b[1]]]);
+  };
+  const h = pair(flip(bends[3]), bends[1]); // left side runs bottom-up, right side top-down
+  if (h.length) return { axis: "h", lines: h };
+  const v = pair(bends[0], flip(bends[2]));
+  return v.length ? { axis: "v", lines: v } : null;
+}
+function fitLine(pts) { // total least squares
+  let mx = 0, my = 0;
+  for (const p of pts) { mx += p[0]; my += p[1]; }
+  mx /= pts.length; my /= pts.length;
+  let sxx = 0, sxy = 0, syy = 0;
+  for (const p of pts) { const x = p[0] - mx, y = p[1] - my; sxx += x * x; sxy += x * y; syy += y * y; }
+  const ang = 0.5 * Math.atan2(2 * sxy, sxx - syy);
+  return { p: [mx, my], d: [Math.cos(ang), Math.sin(ang)] };
+}
+function intersect(l1, l2) {
+  const den = l1.d[0] * l2.d[1] - l1.d[1] * l2.d[0];
+  if (Math.abs(den) < 1e-6) return null;
+  const t = ((l2.p[0] - l1.p[0]) * l2.d[1] - (l2.p[1] - l1.p[1]) * l2.d[0]) / den;
+  return [l1.p[0] + l1.d[0] * t, l1.p[1] + l1.d[1] * t];
 }
 
 function gaussian5(a, w, h) { // separable [1 4 6 4 1] / 16, in place
@@ -601,6 +924,21 @@ function polyPath(ctx, pts) {
   ctx.closePath();
 }
 
+// The page outline: the 4 corners plus, on folded pages, the points where each fold
+// meets the page edge (the outline bends there).
+function outline() {
+  const [tl, tr, br, bl] = state.corners, f = state.folds;
+  if (!f) return [tl, tr, br, bl];
+  const a = f.lines.map((l) => l[0]), b = f.lines.map((l) => l[1]);
+  return f.axis === "h" ? [tl, tr, ...b, br, bl, ...a.reverse()] : [tl, ...a, tr, br, ...b.reverse(), bl];
+}
+// Everything the user can drag: corners first, then fold ends.
+function handles() {
+  const list = state.corners.map((p, i) => ({ p, set: (v) => { state.corners[i] = v; }, corner: true }));
+  if (state.folds) state.folds.lines.forEach((l, j) => l.forEach((p, k) => list.push({ p, set: (v) => { state.folds.lines[j][k] = v; }, corner: false })));
+  return list;
+}
+
 function drawEditor() {
   if (!layout) return;
   const { dpr, s, ox, oy } = layout;
@@ -609,7 +947,7 @@ function drawEditor() {
   ectx.clearRect(0, 0, layout.w, layout.h);
   ectx.imageSmoothingQuality = "high";
   ectx.drawImage(state.view, ox, oy, iw, ih);
-  const pts = state.corners.map(toScreen);
+  const pts = outline().map(toScreen);
 
   // Dim everything outside the selection.
   ectx.beginPath();
@@ -618,18 +956,30 @@ function drawEditor() {
   ectx.fillStyle = "rgba(0,0,0,.5)";
   ectx.fill("evenodd");
 
+  // Fold lines (dashed)
+  if (state.folds) {
+    ectx.save();
+    ectx.setLineDash([7, 6]); ectx.lineWidth = 1.5; ectx.strokeStyle = "rgba(255,255,255,.85)";
+    for (const l of state.folds.lines) {
+      const [a, b] = l.map(toScreen);
+      ectx.beginPath(); ectx.moveTo(a[0], a[1]); ectx.lineTo(b[0], b[1]); ectx.stroke();
+    }
+    ectx.restore();
+  }
+
   // Outline (dark halo + accent line, visible on any background).
   ectx.lineJoin = "round";
   ectx.beginPath(); polyPath(ectx, pts);
   ectx.strokeStyle = "rgba(0,0,0,.45)"; ectx.lineWidth = 5; ectx.stroke();
   ectx.strokeStyle = "#4f8cff"; ectx.lineWidth = 2.5; ectx.stroke();
 
-  pts.forEach((p, i) => {
-    const active = drag && drag.i === i;
-    ectx.beginPath(); ectx.arc(p[0], p[1], active ? 20 : 15, 0, Math.PI * 2);
+  handles().forEach((hd, i) => {
+    const p = toScreen(hd.p), active = drag && drag.i === i;
+    const r = hd.corner ? (active ? 20 : 15) : (active ? 15 : 10);
+    ectx.beginPath(); ectx.arc(p[0], p[1], r, 0, Math.PI * 2);
     ectx.fillStyle = active ? "rgba(79,140,255,.45)" : "rgba(79,140,255,.28)"; ectx.fill();
-    ectx.lineWidth = 3; ectx.strokeStyle = "#fff"; ectx.stroke();
-    ectx.beginPath(); ectx.arc(p[0], p[1], 3, 0, Math.PI * 2);
+    ectx.lineWidth = hd.corner ? 3 : 2.5; ectx.strokeStyle = "#fff"; ectx.stroke();
+    ectx.beginPath(); ectx.arc(p[0], p[1], hd.corner ? 3 : 2.5, 0, Math.PI * 2);
     ectx.fillStyle = "#fff"; ectx.fill();
   });
 }
@@ -637,7 +987,7 @@ function drawEditor() {
 function drawLoupe() {
   if (!drag) { loupe.hidden = true; return; }
   const L = 132, { dpr } = layout;
-  const [cx, cy] = state.corners[drag.i];
+  const [cx, cy] = handles()[drag.i].p;
   const sp = toScreen([cx, cy]);
   // Keep the magnifier away from the finger.
   loupe.classList.toggle("right", sp[0] < 170 && sp[1] < 190);
@@ -649,7 +999,7 @@ function drawLoupe() {
   lctx.translate(L / 2, L / 2); lctx.scale(z, z); lctx.translate(-cx, -cy);
   lctx.imageSmoothingQuality = "high";
   lctx.drawImage(state.src, 0, 0);
-  lctx.beginPath(); polyPath(lctx, state.corners);
+  lctx.beginPath(); polyPath(lctx, outline());
   lctx.strokeStyle = "#4f8cff"; lctx.lineWidth = 2 / z; lctx.stroke();
   lctx.restore();
   lctx.strokeStyle = "#fff"; lctx.lineWidth = 1.5;
@@ -668,7 +1018,7 @@ function localXY(e) {
 ecv.addEventListener("pointerdown", (e) => {
   if (!layout || drag) return;
   const [sx, sy] = localXY(e);
-  const pts = state.corners.map(toScreen);
+  const pts = handles().map((hd) => toScreen(hd.p));
   let best = -1, bd = e.pointerType === "mouse" ? 30 : 56;
   pts.forEach((p, i) => { const d = Math.hypot(p[0] - sx, p[1] - sy); if (d < bd) { bd = d; best = i; } });
   if (best < 0) return;
@@ -683,7 +1033,7 @@ ecv.addEventListener("pointermove", (e) => {
   if (!drag || e.pointerId !== drag.id) return;
   const [sx, sy] = localXY(e);
   const [x, y] = toImage(sx + drag.dx, sy + drag.dy);
-  state.corners[drag.i] = [clamp(x, 0, state.src.width), clamp(y, 0, state.src.height)];
+  handles()[drag.i].set([clamp(x, 0, state.src.width), clamp(y, 0, state.src.height)]);
   drawEditor(); drawLoupe();
 });
 function endDrag(e) {
@@ -694,9 +1044,9 @@ ecv.addEventListener("pointerup", endDrag);
 ecv.addEventListener("pointercancel", endDrag);
 window.addEventListener("resize", () => requestAnimationFrame(layoutEditor));
 
-$("#adjReset").onclick = () => { state.corners = defaultCorners(state.src.width, state.src.height); setHint(""); drawEditor(); };
+$("#adjReset").onclick = () => { state.corners = defaultCorners(state.src.width, state.src.height); state.folds = null; setHint(""); drawEditor(); };
 $("#adjAuto").onclick = () => {
-  if (state.autoCorners) { state.corners = state.autoCorners.map((p) => [...p]); setHint("Page found. Drag a circle to fine-tune."); }
+  if (state.auto) { applyAuto(); setHint(autoHint()); }
   else toast("Couldn't find the page edges in this photo. Place the corners by hand.");
   drawEditor();
 };
@@ -743,29 +1093,104 @@ function squareToQuad(q) {
   };
 }
 
-function outputSize(q) {
-  let W = Math.max(dist(q[0], q[1]), dist(q[3], q[2]));
-  let H = Math.max(dist(q[0], q[3]), dist(q[1], q[2]));
-  const r = RATIOS[state.ratio];
-  if (r) {
-    const long = Math.max(W, H);
-    if (H >= W) { H = long; W = long / r; } else { W = long; H = long / r; }
-  }
-  const k = Math.min(1, MAX_OUT / Math.max(W, H));
-  return [Math.max(1, Math.round(W * k)), Math.max(1, Math.round(H * k))];
+// True width/height of the photographed rectangle, undoing perspective with a pinhole
+// camera model (Zhang & He, "Whiteboard scanning and image enhancement"). The focal
+// length is estimated from the quad itself; when the photo is taken nearly straight-on
+// that estimate is unstable and a typical phone value is used instead.
+function perspectiveTerms(q, w, h) {
+  const u0 = w / 2, v0 = h / 2;
+  const m1 = [q[0][0], q[0][1], 1], m2 = [q[1][0], q[1][1], 1], m3 = [q[3][0], q[3][1], 1], m4 = [q[2][0], q[2][1], 1];
+  const cross = (a, b) => [a[1] * b[2] - a[2] * b[1], a[2] * b[0] - a[0] * b[2], a[0] * b[1] - a[1] * b[0]];
+  const dot = (a, b) => a[0] * b[0] + a[1] * b[1] + a[2] * b[2];
+  const k2 = dot(cross(m1, m4), m3) / dot(cross(m2, m4), m3);
+  const k3 = dot(cross(m1, m4), m2) / dot(cross(m3, m4), m2);
+  return { u0, v0, n2: m2.map((v, i) => k2 * v - m1[i]), n3: m3.map((v, i) => k3 * v - m1[i]) };
+}
+// Camera focal length (pixels) implied by a photographed rectangle, or null if unreliable.
+function focalLength(q, w, h) {
+  const { u0, v0, n2: [a1, a2, a3], n3: [b1, b2, b3] } = perspectiveTerms(q, w, h), diag = Math.hypot(w, h);
+  const f2 = -((a1 * b1 - (a1 * b3 + a3 * b1) * u0 + a3 * b3 * u0 * u0) + (a2 * b2 - (a2 * b3 + a3 * b2) * v0 + a3 * b3 * v0 * v0)) / (a3 * b3);
+  const f = f2 > 0 ? Math.sqrt(f2) : NaN;
+  return f > 0.25 * diag && f < 4 * diag ? f : null;
+}
+// True width / height of a photographed rectangle seen through a camera of focal length f.
+function perspectiveRatio(q, w, h, f) {
+  const { u0, v0, n2, n3 } = perspectiveTerms(q, w, h);
+  const len2 = (v) => { const x = (v[0] - u0 * v[2]) / f, y = (v[1] - v0 * v[2]) / f; return x * x + y * y + v[2] * v[2]; };
+  const r = Math.sqrt(len2(n2) / len2(n3));
+  return isFinite(r) && r > 0.05 && r < 20 ? r : null;
 }
 
-function warp(q, W, H) {
+// Splits the page into flat panels at its folds (one panel if it isn't folded).
+function makePanels(q, folds) {
+  const [tl, tr, br, bl] = q;
+  if (!folds) return [q];
+  const a = folds.lines.map((l) => l[0]), b = folds.lines.map((l) => l[1]);
+  const panels = [];
+  if (folds.axis === "h") { // stacked top to bottom
+    const L = [tl, ...a, bl], R = [tr, ...b, br];
+    for (let i = 0; i + 1 < L.length; i++) panels.push([L[i], R[i], R[i + 1], L[i + 1]]);
+  } else { // side by side, left to right
+    const T = [tl, ...a, tr], B = [bl, ...b, br];
+    for (let i = 0; i + 1 < T.length; i++) panels.push([T[i], T[i + 1], B[i + 1], B[i]]);
+  }
+  return panels.every(isConvex) ? panels : [q];
+}
+
+// Size of the straightened page and where each panel goes in it.
+function outputLayout(q, folds) {
+  const sw = state.src.width, sh = state.src.height, diag = Math.hypot(sw, sh);
+  const panels = makePanels(q, folds), vertical = panels.length > 1 && folds.axis === "v";
+  // One camera took the photo: estimate its focal length from every flat panel.
+  const fs = [q, ...panels].map((p) => focalLength(p, sw, sh)).filter(Boolean).sort((x, y) => x - y);
+  const f = fs.length ? fs[fs.length >> 1] : 0.65 * diag;
+  // Each panel's true shape; panels share the page width (or height for vertical folds).
+  const shapes = panels.map((p) => perspectiveRatio(p, sw, sh, f) || Math.max(dist(p[0], p[1]), dist(p[3], p[2])) / Math.max(dist(p[0], p[3]), dist(p[1], p[2])));
+  const across = vertical
+    ? Math.max(...panels.map((p) => Math.max(dist(p[0], p[3]), dist(p[1], p[2]))))
+    : Math.max(...panels.map((p) => Math.max(dist(p[0], p[1]), dist(p[3], p[2]))));
+  let parts = shapes.map((r) => (vertical ? across * r : across / r)); // panel widths or heights
+  const along = parts.reduce((x, y) => x + y, 0);
+  let W = vertical ? along : across, H = vertical ? across : along;
+  // Whole-page shape: a chosen paper size, or snap to A4 / US Letter when within a few percent.
+  let r = W / H;
+  const fixed = RATIOS[state.ratio];
+  if (fixed) r = W > H ? fixed : 1 / fixed;
+  else for (const std of [RATIOS.a4, RATIOS.letter]) for (const s of [std, 1 / std]) if (Math.abs(r / s - 1) < 0.035) r = s;
+  const k0 = vertical ? (H * r) / W : W / r / H; // stretch along the folds' direction to reach r
+  parts = parts.map((v) => v * k0);
+  if (vertical) W *= k0; else H *= k0;
+  // Keep at least the photo's resolution along the longest measured side, within MAX_OUT.
+  const measured = Math.max(...q.map((p, i) => dist(p, q[(i + 1) % 4])));
+  const k = Math.min(Math.max(1, measured / Math.max(W, H)), MAX_OUT / Math.max(W, H));
+  W = Math.max(1, Math.round(W * k)); H = Math.max(1, Math.round(H * k));
+  const rects = [];
+  let acc = 0;
+  parts.forEach((v, i) => {
+    const start = Math.round(acc * k), end = i === parts.length - 1 ? (vertical ? W : H) : Math.round((acc + v) * k);
+    rects.push(vertical ? [start, 0, end - start, H] : [0, start, W, end - start]);
+    acc += v;
+  });
+  return { W, H, panels: panels.map((p, i) => ({ quad: p, rect: rects[i] })) };
+}
+
+function warp(layoutOut) {
   if (!state.srcData) state.srcData = state.src.getContext("2d").getImageData(0, 0, state.src.width, state.src.height);
+  const { W, H, panels } = layoutOut;
+  const out = new ImageData(W, H);
+  for (const p of panels) warpPanel(out, p.quad, p.rect);
+  return out;
+}
+function warpPanel(out, q, [rx, ry, rw, rh]) {
   const sw = state.src.width, sh = state.src.height, sd = state.srcData.data;
-  const out = new ImageData(W, H), od = out.data;
+  const od = out.data, W = out.width;
   const { a, b, c, d, e, f, g, h } = squareToQuad(q);
   const maxX = sw - 1, maxY = sh - 1;
-  let o = 0;
-  for (let y = 0; y < H; y++) {
-    const v = (y + 0.5) / H;
-    for (let x = 0; x < W; x++, o += 4) {
-      const u = (x + 0.5) / W;
+  for (let y = ry; y < ry + rh; y++) {
+    const v = (y - ry + 0.5) / rh;
+    let o = (y * W + rx) * 4;
+    for (let x = rx; x < rx + rw; x++, o += 4) {
+      const u = (x - rx + 0.5) / rw;
       const den = g * u + h * v + 1;
       let sx = (a * u + b * v + c) / den - 0.5;
       let sy = (d * u + e * v + f) / den - 0.5;
@@ -784,7 +1209,6 @@ function warp(q, W, H) {
       od[o + 3] = 255;
     }
   }
-  return out;
 }
 
 /* ---------- Looks (filters) ---------- */
@@ -906,12 +1330,12 @@ function adjustImage(img, a) {
 async function doScan() {
   const q = orderCorners(state.corners);
   if (!isConvex(q)) { toast("The corners cross over. Drag them onto the 4 page corners."); return; }
+  if (q.some((p, i) => p !== state.corners[i] && dist(p, state.corners[i]) > 0)) state.folds = null; // corners were swapped around
   state.corners = q;
   busy(true);
   await nextFrame();
   try {
-    const [W, H] = outputSize(q);
-    state.base = warp(q, W, H);
+    state.base = warp(outputLayout(q, state.folds));
     state.full = {}; state.small = {};
     state.rotation = 0;
     state.currentAdded = false;
